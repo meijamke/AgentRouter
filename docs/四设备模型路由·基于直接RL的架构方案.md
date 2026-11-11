@@ -1,8 +1,8 @@
-# 四设备模型路由 · 架构设计与整体方案（agent 多步路由版 v18）
+# 四设备模型路由 · 架构设计与整体方案（agent 多步路由版 v19）
 
 > **定位**：四设备（手表/手机/平板/PC）+ 云，做 **agent 多步路由**——一个 query 拆多步，每步选一台执行设备/模型。
 > **核心**：**单层 MDP**，直接 RL 优化「任务最终成功 − 累计调用成本」（成本随能力档递增，云/强设备自然最贵）。
-> **v18 补充**：明确「路由 vs 自我改进」两个正交轴（§7.1）；M4 演进为「路由内化为 agent 能力 + 自我改进 LLM」（RSI/CERA-MoA 终局）。
+> **v19 守弱查漏**：补 10 处——稀疏奖励 shaping、成本函数公式、IL 标签对齐动作空间、T_max 对齐 RLCascadeRouter、设备池 mask 语义、P(fail) 量纲归一化、quality 来源、M1 范围、评估口径、技能 token 代价。
 
 ---
 
@@ -24,8 +24,10 @@
 State:  s_t = ( 轨迹摘要, 任务进度, 上一步输出 + P(fail), 已用成本 C_t, 设备状态 D_t, 步数 t )
 Action: a_t ∈ { Stop } ∪ { d_i : d_i ∈ 在线可执行设备池 }   # 动态集合，不枚举类型
 Reward: R = 任务最终成功 − Σ 各设备调用成本              # 成本 = f(能力强度, 延迟, 能耗, KV)，云自然最贵
-折扣/深度: γ = 1；不设 T_max（以 Stop 或任务自然完成为止）
+折扣/深度: γ = 1；设 T_max = 可执行设备数（M1 = 3 档设备 → T_max=3；对齐 RLCascadeRouter 的 T_max = 候选模型数、每个模型最多选一次，防无限级联）
 ```
+
+**成本函数（每步）**：`κ(设备i) = c_tier(cap_embed_i) + λ_lat·latency_ms/1000 + λ_energy·energy_j + λ_kv·kv_bytes`（本机 kv=0；`c_tier` 随能力档递增保证"云最贵"；λ 为超参，M1 先归一化到 [0,1] 标定）。
 
 **为什么单层**：RLCascadeRouter / Hera / GraphPlanner 全是单层 MDP。之前的"外层轨迹 + 内层级联"两层是过度设计——"级联"在 agent 多步里就是"下一步重试"，是同一 MDP 里的一个 action，不需要独立层。
 
@@ -41,7 +43,7 @@ VAS： Stop Gate 产 STOP/CONTINUE（这一步够不够好、要不要继续/重
 最终： softmax( mask( [logit_stop] ∪ [logit_cont + score_i] ) )
 ```
 
-**P(fail)**（学出来 + Brier 校准的失败概率）作为**状态**喂 VAS——告诉策略"上一步成色如何"。
+**P(fail)**（学出来 + Brier 校准的失败概率）作为**状态**喂 VAS——告诉策略"上一步成色如何"。⚠️ 其底层特征（熵/logP/集成分歧）需**按能力档归一化**（0.5B 与 70B 的 logP 尺度不同，直接拼接会误导 VAS）；校准器按 cap_embed 条件化。
 
 > **论文分工**（不冗余，三个正交维度）：
 > - **Hera** → 训练范式（IL 冷启动 + cost-aware RL）
@@ -53,9 +55,11 @@ VAS： Stop Gate 产 STOP/CONTINUE（这一步够不够好、要不要继续/重
 ## 4. 训练（Hera 两阶段）
 
 ```
-① IL 冷启动：回放最高能力档设备的轨迹，端侧 agent 的每个状态打标签 = "端侧/目标动作是否一致" → 监督分类
+① IL 冷启动：回放最高能力档设备的轨迹，每个状态打标签 = **最便宜够用设备**（依次试 weak→medium→strong，取第一个与 oracle 答案一致者，多分类对齐动作空间）→ 监督分类
 ② cost-aware RL：按"更高回报 + 更少高成本调用"更新；分组相同状态；联合优化 任务成功 + 调用效率
 ```
+
+**中间奖励 shaping（解决稀疏奖励）**：主奖励是延迟的「成功−成本」，几十步任务仅终态信号训练不动——每步加增量势函数 `r_t = U(s_{t+1})−U(s_t)`，`U = α·质量̂(当前步) + (1−α)·成本节省̂(累计)`，累计即终态效用（RLCascadeRouter 增量 ΔU）。
 
 奖励归一化（对齐 RLCascadeRouter 公式 8–11）：
 ```
@@ -74,6 +78,8 @@ VAS： Stop Gate 产 STOP/CONTINUE（这一步够不够好、要不要继续/重
 | `StepObservation` | latency_ms, energy_j, kv_bytes, kv_ms, quality, success |
 | `TrainingRecord` | 轨迹（state/action/reward 序列 + 终态效用） |
 | `StrategyPackage` | version, vas_weights, ce_weights, p_fail_weights |
+
+> **quality 来源（M1）**：benchmark 客观 GT（ALFWorld/WebShop 有可执行环境判定每步对错）；过程验证器（R2V）留 M2+ 作无 GT 场景替代。
 
 ---
 
@@ -96,10 +102,12 @@ VAS： Stop Gate 产 STOP/CONTINUE（这一步够不够好、要不要继续/重
 
 | 里程碑 | 交付 | 验收 | 核心依据 |
 |---|---|---|---|
-| **M1** | agent 多步路由：单层 MDP + VAS/CE + Hera 两阶段训练（本机+邻居设备起步） | 多步任务成功率↑、高成本调用↓ | Hera + RLCascadeRouter |
+| **M1** | agent 多步路由：单层 MDP + VAS/CE + Hera 两阶段训练（3 档模拟设备 weak/medium/strong，映射 手机/PC/云 抽象） | 多步任务成功率↑、高成本调用↓ | Hera + RLCascadeRouter |
 | **M2** | 在线更新：云侧 bandit 持续精调 | regret↓、无退化 | WISERouter |
 | **M3** | 四设备全池 + KV 迁移优化 | 延迟↓、KV 成本↓ | Unified AI Gateway |
 | **M4（远期）** | 路由内化为 agent 能力 + 自我改进 LLM（轴A内部 + 轴B训 LLM） | 端到端自进化 | RSI / CERA-MoA / SPIN |
+
+> **评估口径**：Hera 式成功率@成本 → LLMRouterBench 式 PGR/APD/成本节省率 → Pareto 前沿；基线含 纯弱/纯强/oracle(最便宜够用)/随机/固定阈值 + **RSI-Router**。
 
 ---
 
@@ -121,7 +129,7 @@ VAS： Stop Gate 产 STOP/CONTINUE（这一步够不够好、要不要继续/重
 
 **M4 具体做法（吸收 RSI-Router，参考 2609.34712）**：
 - ①「子任务」→ VAS/CE 的**状态特征**（替换手工 progress，使其能按子任务精细路由，如 Locate 用 PC / Verify 用手机）；
-- ②「技能」→ 设备的**执行增强**（执行时追加"子任务×设备"专属技能 prompt，临时提升设备有效能力，等价 cap_embed 临时提升）。
+- ②「技能」→ 设备的**执行增强**（执行时追加"子任务×设备"专属技能 prompt，临时提升设备有效能力，等价 cap_embed 临时提升）。⚠️ 代价：技能=追加 prompt，增加每步输入 token（论文明计 skill context），会侵蚀 VAS/CE 延迟优势——M4 吸收时需量化"技能 token 成本 vs 质量/成本收益"，技能应短且可复用。
 
 **吸收原则（避免重新引入模型耦合）**：技能绑「**能力档**」不绑「模型名」；把"模型专属失败画像"下沉到 **cap_embed**（换模型只更新 cap_embed，技能不失效）；技能靠 **M2 在线微调（触发式）** 做精细自适应，而非换模型就全量重生成。这样吸收后仍保持"能力档抽象、模型可替换"的解耦优势。
 
@@ -133,7 +141,8 @@ VAS： Stop Gate 产 STOP/CONTINUE（这一步够不够好、要不要继续/重
 | 云侧大模型换掉 | ⚠️ 重训（技能演化参照轨迹 r_L 变了） | ✅ 同上 |
 | proposal agent 换 | ✅ 不重训（只影响下一轮进化） | 无对应 |
 | 任务分布漂移 | ⚠️ 重跑整个 G 轮进化 | ✅ M2 在线 bandit 持续精调 |
-| 设备池变化 | 未涵盖 | ✅ 动作空间动态 mask |
+| 设备池变化（同档加入/退出） | 未涵盖 | ✅ 动作空间动态 mask |
+| 新「能力档」设备（cap_embed 分布外） | ⚠️ 需重挖子任务 | ⚠️ VAS/CE 未见该值、泛化无保证 → 重训/在线精调 |
 
 **更新频率（触发式，非固定定时）**：端侧阈值分钟级 / 云侧权重 24h 或按批 / 完整重进化周级 / 增量技能日级；触发条件 = 累计新轨迹 ≥ N、或检测到分布漂移、或设备池变化。
 
