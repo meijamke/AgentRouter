@@ -1,7 +1,8 @@
-# 四设备模型路由 · 架构设计与整体方案（agent 多步路由版 v17）
+# 四设备模型路由 · 架构设计与整体方案（agent 多步路由版 v18）
 
 > **定位**：四设备（手表/手机/平板/PC）+ 云，做 **agent 多步路由**——一个 query 拆多步，每步选一台执行设备/模型。
 > **核心**：**单层 MDP**，直接 RL 优化「任务最终成功 − 累计调用成本」（成本随能力档递增，云/强设备自然最贵）。
+> **v18 补充**：明确「路由 vs 自我改进」两个正交轴（§7.1）；M4 演进为「路由内化为 agent 能力 + 自我改进 LLM」（RSI/CERA-MoA 终局）。
 
 ---
 
@@ -98,6 +99,25 @@ VAS： Stop Gate 产 STOP/CONTINUE（这一步够不够好、要不要继续/重
 | **M1** | agent 多步路由：单层 MDP + VAS/CE + Hera 两阶段训练（本机+邻居设备起步） | 多步任务成功率↑、高成本调用↓ | Hera + RLCascadeRouter |
 | **M2** | 在线更新：云侧 bandit 持续精调 | regret↓、无退化 | WISERouter |
 | **M3** | 四设备全池 + KV 迁移优化 | 延迟↓、KV 成本↓ | Unified AI Gateway |
+| **M4（远期）** | 路由内化为 agent 能力 + 自我改进 LLM（轴A内部 + 轴B训 LLM） | 端到端自进化 | RSI / CERA-MoA / SPIN |
+
+---
+
+### 7.1 路由 vs 自我改进：两个正交轴（演进框架）
+
+| 方案 | 轴A 路由器在哪 | 轴B 更新谁 |
+|---|---|---|
+| 本方案（AgentRouter） | 外部（独立 VAS/CE） | 路由器 |
+| RSI / NeoHorse | 内部（agent 流水线一环） | agent 的 LLM |
+| SPIN / ReST-MCTS / Tao | —（不一定是路由） | agent 的 LLM |
+| CERA-MoA | 内部（co-evolve） | 两者都更新 |
+
+- **轴A（路由器在哪）**：外部独立组件，还是 agent 的内在元认知能力（约束/验证/纠正 = "这任务我做不做得了、要不要升级求助"）；
+- **轴B（更新谁）**：闭环里训路由器，还是训被路由的模型（agent LLM）。
+
+**关键澄清**：SPIN/ReST-MCTS/Tao 本质是「自我改进 LLM」（反馈来自自对弈判别 / 过程奖励 / MCTS 树搜索），与"路由"无必然关系；**只有 NeoHorse 把"自我改进"和"路由采数"绑定**。
+
+**演进判断**：M1–M3 走「轴A外部 + 轴B训路由器」（轻量、可独立训练、可复用，端侧务实）；M4+ 演进到「轴A内部 + 轴B训 LLM」（RSI/CERA-MoA 终局）。本方案 `Trajectory`/`device_env` 已在采集"执行轨迹 + 结果 + 能力"，数据管道 **RSI-ready**。
 
 ---
 
@@ -125,3 +145,5 @@ VAS： Stop Gate 产 STOP/CONTINUE（这一步够不够好、要不要继续/重
 
 > 结论：**主骨架 Hera 一篇够搭；充分实现需 RLCascadeRouter（策略）+ ProgRouter（状态）+ 按需取用其余**。不是"只用 3 篇"，也不是"全都要"。
 > **M1 最小实现只认 2 篇**：Hera（训练范式）+ RLCascadeRouter（VAS/CE 结构）；其余（ProgRouter/GraphPlanner/R2V...）→ M2+ 或遇到具体问题时再查。
+>
+> **补充：自我改进 LLM 家族（与"路由"正交，M4+ 参考）**：SPIN（自对弈判别→迭代 SFT）、ReST-MCTS（过程奖励+树搜索→自训练）、Tao（Meta，RL+验证自改进）、NeoHorse/RSI（路由采数→curriculum SFT+on-policy 蒸馏，arXiv 2609.08183）。共同点 = "反馈→更新 agent LLM 权重"，区别只在反馈来源（自对弈/奖励/树搜索/路由）。**路由内化为 agent 能力 + 自我改进 = 终局形态**（见 §7.1）。
