@@ -40,6 +40,20 @@
 
 ---
 
+## 3.5 协作与数据流（图）
+
+**AgentRouter（推理时一步）**——路由器是**独立的轻量网络**，读"压缩特征向量"，不碰 context：
+
+![AgentRouter 数据流](../diagrams/agentrouter-dataflow.png)
+
+**RSI-Router（推理时一步）**——路由器就是**小模型 S 自己**，读"完整 context + 子任务定义 + 技能"：
+
+![RSI-Router 数据流](../diagrams/rsirouter-dataflow.png)
+
+**一句话对比**：AgentRouter 的 router 独立于 agent/LLM（读特征向量、输出设备选择）；RSI-Router 的 router 与执行模型同体（小模型 S 读完整 context 决策 + 兼职执行）。
+
+---
+
 ## 4. 与 AgentRouter 逐项对比
 
 | 维度 | RSI-Router | AgentRouter |
