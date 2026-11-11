@@ -42,17 +42,17 @@
 
 ## 3.5 协作与数据流（参考 Agent 的 Model-Harness 闭环结构）
 
-**AgentRouter**——路由器（VAS/CE）是 **Harness 里的独立组件**，夹在"上下文"和"Model"之间，读特征向量选设备：
+**AgentRouter**——Router（VAS/CE）在「上下文 → LLM」之间**横插一脚**：读特征向量选设备，上下文**原样通过、不修改**：
 
 ![AgentRouter harness 结构](../diagrams/agentrouter-harness.png)
 
-**RSI-Router**——路由器**就是 Model（小模型 S）本身**，上下文里塞了"子任务定义 + 识别规则 + 技能"：
+**RSI-Router**——在上下文的**后面追加**「子任务定义 + 识别规则 + 技能」，小模型 S 读"原文 + 追加"的完整上下文做路由 + 执行：
 
 ![RSI-Router harness 结构](../diagrams/rsirouter-harness.png)
 
-**一句话对比**：
-- AgentRouter：**Router 是 Harness 的独立组件**（读特征向量 → 选设备），Model 只负责执行，路由与执行分离；
-- RSI-Router：**Router = Model**（小模型 S 读完整上下文，路由 + 执行同体），Codex 离线把策略+技能注入上下文。
+**一句话对比**（关键位置差异）：
+- AgentRouter：**上下文 → [Router 横插一脚 · 选设备] → LLM**——上下文不变，只换"喂给哪个 LLM"；
+- RSI-Router：**上下文 + [后面追加 子任务定义 / 技能] → LLM**——追加内容进上下文，小模型读全文。
 
 ---
 
