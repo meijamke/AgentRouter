@@ -42,17 +42,22 @@
 
 ## 3.5 协作与数据流（参考 Agent 的 Model-Harness 闭环结构）
 
-**AgentRouter**——Router（VAS/CE）在「上下文 → LLM」之间**横插一脚**：读特征向量选设备，上下文**原样通过、不修改**：
+**AgentRouter**——Router 是「读独立特征向量的旁路决策器」，**只**回答"上下文喂给哪台设备"，上下文不动、不追加任何内容：
 
 ![AgentRouter harness 结构](../diagrams/agentrouter-harness.png)
 
-**RSI-Router**——在上下文的**后面追加**「子任务定义 + 识别规则 + 技能」，小模型 S 读"原文 + 追加"的完整上下文做路由 + 执行：
+**RSI-Router**——Router = 小模型 S + 查表，**既**回答"喂给 L 还是 S"（选模型），**又**往被选模型的输入里追加技能文本：
 
 ![RSI-Router harness 结构](../diagrams/rsirouter-harness.png)
 
-**一句话对比**（关键位置差异）：
-- AgentRouter：**上下文 → [Router 横插一脚 · 选设备] → LLM**——上下文不变，只换"喂给哪个 LLM"；
-- RSI-Router：**上下文 + [后面追加 子任务定义 / 技能] → LLM**——追加内容进上下文，小模型读全文。
+**准确对比**（两者都"选模型"，RSI 额外多"追加"）：
+
+| | 选模型（改接收者） | 追加内容（改输入） |
+|---|---|---|
+| AgentRouter | ✅ 独立网络读特征向量选设备 | ❌ 无 |
+| RSI-Router | ✅ 小模型 S 预测子任务 → 查表选 L/S | ✅ 追加技能文本 |
+
+关键：**两者都"选模型"**——差别是 AgentRouter 用「独立网络、读特征向量」选（多设备、不追加），RSI 用「小模型预测子任务 + 查表」选 L/S，且额外"往被选模型输入追加技能"。
 
 ---
 
