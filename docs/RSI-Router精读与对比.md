@@ -40,17 +40,19 @@
 
 ---
 
-## 3.5 协作与数据流（图）
+## 3.5 协作与数据流（参考 Agent 的 Model-Harness 闭环结构）
 
-**AgentRouter（推理时一步）**——路由器是**独立的轻量网络**，读"压缩特征向量"，不碰 context：
+**AgentRouter**——路由器（VAS/CE）是 **Harness 里的独立组件**，夹在"上下文"和"Model"之间，读特征向量选设备：
 
-![AgentRouter 数据流](../diagrams/agentrouter-dataflow.png)
+![AgentRouter harness 结构](../diagrams/agentrouter-harness.png)
 
-**RSI-Router（推理时一步）**——路由器就是**小模型 S 自己**，读"完整 context + 子任务定义 + 技能"：
+**RSI-Router**——路由器**就是 Model（小模型 S）本身**，上下文里塞了"子任务定义 + 识别规则 + 技能"：
 
-![RSI-Router 数据流](../diagrams/rsirouter-dataflow.png)
+![RSI-Router harness 结构](../diagrams/rsirouter-harness.png)
 
-**一句话对比**：AgentRouter 的 router 独立于 agent/LLM（读特征向量、输出设备选择）；RSI-Router 的 router 与执行模型同体（小模型 S 读完整 context 决策 + 兼职执行）。
+**一句话对比**：
+- AgentRouter：**Router 是 Harness 的独立组件**（读特征向量 → 选设备），Model 只负责执行，路由与执行分离；
+- RSI-Router：**Router = Model**（小模型 S 读完整上下文，路由 + 执行同体），Codex 离线把策略+技能注入上下文。
 
 ---
 
