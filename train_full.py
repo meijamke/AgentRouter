@@ -1,25 +1,28 @@
-"""90 任务全量训练（真执行标签 + save_state 重置 + 检查点断点续跑）。
+"""90 任务全量训练（方案 B：IL 静态标签 + RL 子进程真执行）。
 
-三阶段：① 采集标签（慢，检查点）② IL 训练 ③ cost-aware RL。
+IL 冷启动 = 静态标签（代码不含禁用模块），便宜稳定（不 execute，不撞 env 生命周期 bug）。
+RL = 真执行，每 episode 独立子进程（rl_worker.py，绕开多 env 冲突）。
 """
 import json
 import os
+import subprocess
+import sys
 import time
 
 import torch
 
 os.chdir(r"D:\dsh_space\跨设备模型路由代码")
-import sys
 sys.path.insert(0, os.getcwd())
 
 from src.device_env import CAP_EMBED, TIERS, execute_device, make_device_pool
 from src.policy import Policy
 from src.schema import StepState
 from src.state_encoder import state_to_features
-from src.appworld_env import run_episode_grad
 from appworld import AppWorld, load_task_ids
 
 CHECKPOINT = "il_labels.json"
+FORBIDDEN = ["import requests", "import os", "import subprocess", "import socket",
+             "import urllib", "import http", "import sys", "open("]
 
 
 def build_prompt(world):
@@ -31,23 +34,15 @@ def build_prompt(world):
     )
 
 
-def il_label(task_id: str) -> int:
-    """真执行标签：一个环境 save_state，每设备 execute 后 load_state 重置。"""
+def static_label(task_id: str) -> int:
+    """静态标签：最便宜且代码不含禁用模块（会正确用 App API）。"""
     world = AppWorld(task_id)
     prompt = build_prompt(world)
-    init_id = world.save_state()
+    world.close()
     for tier in TIERS:                          # weak → medium → strong
         code, _, _ = execute_device(tier, [{"role": "user", "content": prompt}], mock=False)
-        try:
-            world.execute(code.strip())
-            success = bool(world.evaluate().success)
-        except Exception:
-            success = False
-        world.load_state(init_id)               # 重置到初始状态
-        if success:
-            world.close()
+        if not any(f in code for f in FORBIDDEN):
             return TIERS.index(tier)
-    world.close()
     return TIERS.index("strong")
 
 
@@ -61,7 +56,7 @@ def collect_labels(task_ids):
             continue
         t0 = time.time()
         try:
-            labels[tid] = il_label(tid)
+            labels[tid] = static_label(tid)
             print(f"[{i+1}/{len(task_ids)}] {tid} -> {TIERS[labels[tid]]}  ({time.time()-t0:.0f}s)", flush=True)
         except Exception as e:
             labels[tid] = TIERS.index("strong")
@@ -95,23 +90,32 @@ def train_il(policy, labels, devices, epochs=5):
     return policy
 
 
-def train_rl(policy, task_ids, devices, epochs=3, lam=0.3):
+def train_rl(policy, task_ids, devices, epochs=3, lam=0.3, n_tasks=5):
+    """子进程 rollout：每个 episode 独立子进程跑真执行，返回 (feats, actions, success, cost)。"""
+    dev_emb = torch.tensor([CAP_EMBED[t] for t in TIERS], dtype=torch.float32).unsqueeze(0)
+    mask = torch.ones(1, len(TIERS))
     opt = torch.optim.Adam(policy.parameters(), lr=3e-4)
     for ep in range(epochs):
+        torch.save(policy.state_dict(), "policy_tmp.pt")
         batch = []
-        for tid in task_ids[:10]:   # RL 先用前 10 个任务（真执行慢）
-            from src.appworld_env import AppworldEnv
-            env = AppworldEnv(tid)
-            lps, acts, success, cost, steps = run_episode_grad(policy, env, devices, max_steps=4)
-            reward = (1.0 if success else 0.0) - lam * cost
-            batch.append((lps, reward, success, cost))
-            env.close()
-        base = sum(b[1] for b in batch) / len(batch)
+        for tid in task_ids[:n_tasks]:
+            out_file = f"rl_out_{tid}.json"
+            subprocess.run([sys.executable, "rl_worker.py", tid, "policy_tmp.pt", out_file],
+                           check=True, cwd=os.getcwd())
+            r = json.load(open(out_file, encoding="utf-8"))
+            batch.append((r["feats"], r["actions"], r["success"], r["cost"]))
+
+        rewards = [(1.0 if s else 0.0) - lam * c for _, _, s, c in batch]
+        base = sum(rewards) / len(rewards)
         total_loss = 0.0; n = 0
-        for lps, reward, success, cost in batch:
+        for (feats, acts, s, c), reward in zip(batch, rewards):
             G = reward - base
-            for lp in lps:
-                total_loss = total_loss - lp * G; n += 1
+            for f, a in zip(feats, acts):
+                feat = torch.tensor(f).unsqueeze(0)
+                logits, _ = policy(feat, dev_emb, mask, torch.tensor([[0.0]]))
+                dist = torch.distributions.Categorical(logits=logits)
+                total_loss = total_loss - dist.log_prob(torch.tensor([a])) * G
+                n += 1
         opt.zero_grad(); total_loss.backward(); opt.step()
         succ = sum(1 for b in batch if b[2]) / len(batch)
         avg_c = sum(b[3] for b in batch) / len(batch)
@@ -122,17 +126,18 @@ def train_rl(policy, task_ids, devices, epochs=3, lam=0.3):
 
 if __name__ == "__main__":
     torch.manual_seed(0)
-    ids = load_task_ids("train")   # 90 任务
+    ids = load_task_ids("train")
     devices = make_device_pool()
     policy = Policy()
 
-    print(f"=== ① 采集真执行标签（{len(ids)} 任务）===", flush=True)
+    print(f"=== ① IL 静态标签（{len(ids)} 任务）===", flush=True)
     labels = collect_labels(ids)
+    print("标签分布:", {t: list(labels.values()).count(i) for i, t in enumerate(TIERS)}, flush=True)
 
     print("=== ② IL 训练 ===", flush=True)
     train_il(policy, labels, devices, epochs=5)
 
-    print("=== ③ cost-aware RL ===", flush=True)
-    train_rl(policy, ids, devices, epochs=3)
+    print("=== ③ RL（子进程真执行，前 5 任务）===", flush=True)
+    train_rl(policy, ids, devices, epochs=3, n_tasks=5)
 
     print("全量训练完成", flush=True)
