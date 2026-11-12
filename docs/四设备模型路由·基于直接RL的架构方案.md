@@ -31,6 +31,8 @@
 - 一次"路由决策" = 一步选一台设备；
 - `can_execute=False` 的设备（如当前部署的手表）只作入口/输出，**不进动作空间**——这是**部署配置，非架构假设**。
 
+![AgentRouter 完整架构总览（v20）](../diagrams/architecture-overview.png)
+
 ---
 
 ## 2. 单层 MDP（核心）
