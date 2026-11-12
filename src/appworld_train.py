@@ -1,55 +1,56 @@
-"""AppWorld 真实 IL + RL 训练（小规模演示）。
+"""AppWorld 真实 IL + RL 训练。
 
-IL 标签 = 「最便宜够用设备」：依次试 weak→medium→strong，取第一个
-生成的代码**不含禁用模块**（import requests/os/… 会被 AppWorld 沙盒拒绝，
-即"不会正确用 App 的 API"）者——这是"API 使用正确性"的廉价静态代理。
+IL 标签 = 「最便宜够用设备」：依次试 weak→medium→strong，每个设备的代码
+**在新 AppWorld 环境里真正执行**，取第一个「执行后任务真的成功」(evaluate().success)
+的设备——真执行标签，非静态代理。
 """
 from __future__ import annotations
 
 import torch
 import torch.nn as nn
 
-from .appworld_env import AppworldEnv
+from .appworld_env import AppworldEnv, run_episode_grad
 from .device_env import CAP_EMBED, TIERS, execute_device, make_device_pool
 from .policy import Policy
 from .schema import StepState
 from .state_encoder import state_to_features
 
-FORBIDDEN = ["import requests", "import os", "import subprocess",
-             "import socket", "import urllib", "import http", "import sys", "open("]
-
-
-def uses_forbidden(code: str) -> bool:
-    return any(f in code for f in FORBIDDEN)
-
 
 def il_label(env: AppworldEnv) -> int:
-    """返回最便宜够用设备的档位索引（代码不含禁用模块 = 会正确用 API）。"""
+    """返回最便宜够用设备：最便宜且其代码执行后任务真成功。"""
+    from appworld import AppWorld
     prompt = env.prompt()
-    for tier in TIERS:                      # weak → medium → strong
+    for tier in TIERS:                          # weak → medium → strong
         code, _, _ = execute_device(tier, [{"role": "user", "content": prompt}], mock=False)
-        if not uses_forbidden(code):
+        fresh = AppWorld(env.task_id)           # 每个设备用全新环境（execute 会改状态）
+        try:
+            fresh.execute(code.strip())
+            success = bool(fresh.evaluate().success)
+        except Exception:
+            success = False
+        finally:
+            fresh.close()
+        if success:
             return TIERS.index(tier)
     return TIERS.index("strong")
 
 
-def make_state(devices) -> StepState:
+def make_state(devices, step_idx=0) -> StepState:
     return StepState(
         trajectory_summary=[], progress=[0.0, 0.5], last_output="",
-        p_fail=0.0, cost_accum=0.0, device_states=devices, step_idx=0,
+        p_fail=0.0, cost_accum=0.0, device_states=devices, step_idx=step_idx,
     )
 
 
-def train_il(policy: Policy, task_ids, devices, epochs: int = 2, lr: float = 1e-3):
-    print("=== IL 冷启动（真实 API + AppWorld）===")
+def train_il(policy: Policy, task_ids, devices, epochs: int = 3, lr: float = 1e-3):
+    print("=== IL 冷启动（真执行标签）===")
     data = []
     for tid in task_ids:
         env = AppworldEnv(tid)
         label = il_label(env)
-        s = make_state(devices)
-        data.append((s, label))
+        data.append((make_state(devices), label))
         env.close()
-        print(f"  {tid}: 指令={env.instruction[:40]!r} → 最便宜够用设备={TIERS[label]}")
+        print(f"  {tid}: 最便宜够用设备 = {TIERS[label]}")
 
     opt = torch.optim.Adam(policy.parameters(), lr=lr)
     loss_fn = nn.CrossEntropyLoss()
@@ -61,10 +62,39 @@ def train_il(policy: Policy, task_ids, devices, epochs: int = 2, lr: float = 1e-
             f = state_to_features(s).unsqueeze(0)
             pf = torch.tensor([[s.p_fail]])
             logits, _ = policy(f, dev_emb, mask, pf)
-            loss = loss_fn(logits, torch.tensor([label + 1]))   # 动作 0=stop，设备 i=i+1
+            loss = loss_fn(logits, torch.tensor([label + 1]))
             opt.zero_grad(); loss.backward(); opt.step()
             tot += loss.item(); n += 1
         print(f"  IL epoch {ep} loss={tot/n:.4f}")
+    return policy
+
+
+def train_rl(policy: Policy, task_ids, devices, epochs: int = 3, lam: float = 0.3):
+    """REINFORCE：reward = task_success − λ·累计成本。"""
+    print("=== cost-aware RL ===")
+    opt = torch.optim.Adam(policy.parameters(), lr=3e-4)
+    for ep in range(epochs):
+        batch = []
+        for tid in task_ids:
+            env = AppworldEnv(tid)
+            lps, acts, success, cost, steps = run_episode_grad(policy, env, devices, max_steps=4)
+            reward = (1.0 if success else 0.0) - lam * cost
+            batch.append((lps, reward, success, cost))
+            env.close()
+
+        base = sum(b[1] for b in batch) / len(batch)
+        total_loss = 0.0
+        n = 0
+        for lps, reward, success, cost in batch:
+            G = reward - base
+            for lp in lps:
+                total_loss = total_loss - lp * G
+                n += 1
+        opt.zero_grad(); total_loss.backward(); opt.step()
+
+        succ = sum(1 for b in batch if b[2]) / len(batch)
+        avg_c = sum(b[3] for b in batch) / len(batch)
+        print(f"  RL epoch {ep} succ={succ:.2f} cost={avg_c:.3f} loss={total_loss.item()/max(n,1):.4f}")
     return policy
 
 
@@ -77,4 +107,5 @@ if __name__ == "__main__":
     devices = make_device_pool()
     policy = Policy()
     train_il(policy, ids, devices, epochs=2)
-    print("IL 演示完成（RL 复用 train_rl.py 的 shaping 策略梯度，把 benchmark 换成 AppworldEnv 即可）")
+    train_rl(policy, ids, devices, epochs=2)
+    print("AppWorld IL+RL 演示完成")
