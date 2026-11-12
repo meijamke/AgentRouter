@@ -19,6 +19,7 @@ def main():
         "请生成 Python 代码完成任务，只输出代码："
     )
     code, cost, lat = execute_device(tier, [{"role": "user", "content": prompt}], mock=False)
+    out_file = open(out, "w", encoding="utf-8")     # 提前开句柄（execute 会触发 read_only 守卫，之后 open() 会被禁）
     try:
         world.execute(code.strip())
         success = bool(world.evaluate().success)
@@ -27,7 +28,8 @@ def main():
     world.close()
     json.dump({"task": task_id, "tier": tier, "success": success,
                "cost": cost, "lat": lat, "code_head": code[:80]},
-              open(out, "w", encoding="utf-8"))
+              out_file)
+    out_file.close()
 
 
 if __name__ == "__main__":
