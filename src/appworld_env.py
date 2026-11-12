@@ -19,6 +19,7 @@ class AppworldEnv:
 
     def __init__(self, task_id: str):
         from appworld import AppWorld
+        self.task_id = task_id
         self.world = AppWorld(task_id)
         self.instruction = self.world.task.instruction
         self.app_descriptions = str(self.world.task.app_descriptions)
@@ -77,6 +78,40 @@ def run_episode(policy: Policy, env: AppworldEnv, devices, max_steps: int = 5,
         history += f"\n[代码]\n{code}\n[输出]\n{out}\n"
 
     return env.success(), cost, step_idx + 1
+
+
+def run_episode_grad(policy: Policy, env: AppworldEnv, devices, max_steps: int = 5,
+                     mock: bool = False):
+    """带梯度的 rollout（RL 用）：返回 (log_probs, actions, success, cost, n_steps)。"""
+    dev_emb = torch.tensor([CAP_EMBED[t] for t in TIERS], dtype=torch.float32).unsqueeze(0)
+    mask = torch.ones(1, len(TIERS))
+    cost = 0.0
+    history = ""
+    log_probs, actions = [], []
+
+    for step_idx in range(max_steps):
+        s = StepState(
+            trajectory_summary=[], progress=[step_idx / max_steps, 0.5],
+            last_output=history[-200:], p_fail=0.0, cost_accum=cost,
+            device_states=devices, step_idx=step_idx,
+        )
+        f = state_to_features(s).unsqueeze(0)
+        pf = torch.tensor([[s.p_fail]])
+        logits, _ = policy.forward(f, dev_emb, mask, pf)   # 带梯度
+        dist = torch.distributions.Categorical(logits=logits)
+        a = dist.sample()
+        log_probs.append(dist.log_prob(a))
+        actions.append(a.item())
+
+        if a.item() == 0:   # stop
+            break
+        tier = TIERS[a.item() - 1]
+        code, c, _ = execute_device(tier, [{"role": "user", "content": env.prompt(history)}], mock=mock)
+        cost += c
+        out = env.execute(code.strip())
+        history += f"\n[代码]\n{code}\n[输出]\n{out}\n"
+
+    return log_probs, actions, env.success(), cost, step_idx + 1
 
 
 if __name__ == "__main__":
