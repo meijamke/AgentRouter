@@ -1,0 +1,1 @@
+{"task": "82e2fac_1", "tier": "medium", "success": false, "cost": 10.8748, "lat": 0.0, "code_head": "```python\ndef _pick_api(container, names):\n    for name in names:\n        if has"}
