@@ -24,7 +24,7 @@
 | `benchmark.py` | 自建 benchmark（执行类型 × 难度 二维） |
 | `state_encoder.py` | StepState → 特征向量 |
 | `policy.py` | 策略网络（一个网络，10 动作） |
-| `answer_table.py` | 离线答案表（建表/查表/弱强分化） |
+| `answer_table.py` | 离线答案表（建表/查表/强弱分化） |
 | `train_il.py` | IL 冷启动（最便宜够用标签） |
 | `train_rl.py` | cost-aware RL（REINFORCE + shaping） |
 | `smoke_test.py` | 骨架冒烟测试 |
