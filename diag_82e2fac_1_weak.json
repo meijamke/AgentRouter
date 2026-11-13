@@ -1,1 +1,0 @@
-{"task": "82e2fac_1", "tier": "weak", "success": false, "cost": 1.5326000000000002, "lat": 0.0, "code_head": "import inspect\n\n\ndef _get_func(app, names):\n    if app is None:\n        return N"}

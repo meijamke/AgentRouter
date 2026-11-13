@@ -1,1 +1,0 @@
-{"task": "82e2fac_1", "tier": "strong", "success": false, "cost": 13.071, "lat": 0.0, "code_head": "```python\nimport os\nimport sys\nimport requests\n\nBASE_URL = os.environ.get(\"API_B"}
