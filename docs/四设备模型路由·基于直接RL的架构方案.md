@@ -1,18 +1,23 @@
-# 四设备模型路由 · 架构设计与整体方案（agent 多步路由版 v21）
+# 四设备模型路由 · 架构设计与整体方案（agent 多步路由 v22）
 
-> **定位**：四设备（手表/手机/平板/PC）+ 云，做 **agent 多步路由**——一个 query 拆多步，每步选一台执行设备/模型。
-> **核心**：**单层 MDP**，直接 RL 优化「任务最终成功 − 累计调用成本」。
-> **v21 修订**：吸收 RLCascadeRouter 精读 + RouteFM——**M1 训练策略改为「离线答案表 + 查表训练」**（先一次性建表，RL 查表跑几十万局不碰真实 API）；IL 静态标签**只当"不崩"初始化**，RL 真执行采样是核心；验收锚点改为**成本节省**（非成功率）、多种子+误差棒、消融比 Pareto；λ 条件化进策略输入。
+> **定位**：四设备（手表/手机/平板/PC）+ 云，做 **agent 多步路由**——一个 query 拆多步，每步选一台执行设备 + 选一种路由模式。
+> **核心**：**单层 MDP**，直接 RL 优化「任务最终成功 − 累计调用成本」；quality-estimator-free。
+> **v22 修订（今天梳理的正本清源）**：
+> 1. **骨架主次纠正**：Hera（step-level 多步）升为**主骨架**，RLCascadeRouter 的 VAS/CE 降为**策略网络实现**——"级联重试"不再是主轴，而是 multi 模式内部由策略学的 handoff（Handoff Curves 实证：later handoff 未必优于 initial selection）。
+> 2. **M1 就学三路由模式**（RouteWeaver）：动作空间 = `{停} ∪ {single, multi, agentic} × 设备`，模式不再写死。
+> 3. **删 P(fail)**：回到 quality-estimator-free；升级信号推迟 M2 且必须过"五种自欺"清单（2026 一整簇论文证明升级信号易自欺：TRIAGE 0.571 / CreateScore 0.47 / Who Pays 0.510）。
+> 4. **训练 = 离线答案表 + 查表**（RLCascadeRouter 实现细节）；IL 用 Handoff supervision target，RL 用 RIVET response-informed 值估计。
+> 5. **β 只作评估天花板**（1−β），不学、不做训练 ROI gate、不做模式空间剪枝——β 是反事实宏观量，运行时不可得。
 
 ---
 
-## 0. 守弱执行总纲（v21 新增）
+## 0. 守弱执行总纲
 
 > 守弱 = 假设「收益不确定」，先做便宜、可证伪、能回退的。四条执行原则：
 
-1. **训练靠"查表"，不靠"实时调用"**：对有 GT 的 benchmark（AppWorld `evaluate()`），先一次性预生成「设备×任务 → 成功/成本」表，训练时查表——解决"真执行慢 + API 超时"。
-2. **IL 只当"不崩"初始化，RL 真执行采样才是核心**：静态标签（代码不含禁用模块）区分度弱（实测 9/90 全 weak），只用来让策略"先选最便宜设备不崩"，真正的弱/中/强区分靠 RL 的 success−cost 学出来。
-3. **验收看"成本节省"，不看"成功率涨分"**：路由天花板 = 池内最强设备；收益 = 同样成功率省多少成本（RLCascadeRouter 也就 +1~3 分但省 20~34%）。
+1. **训练靠"查表"，不靠"实时调用"**：对有 GT 的 benchmark，先一次性预生成「设备×任务→对错/成本」表，训练时查表——解决"真执行慢 + API 超时"。
+2. **IL 只当"不崩"初始化，RL 真执行采样是核心**：IL 标签区分度弱，只用来让策略"先选最便宜的够用设备、别崩"；真正的弱/中/强分化靠 RL 的 success−cost 学出来。
+3. **验收看"成本节省"，不看"成功率涨分"**：路由天花板 = 池内最强设备；收益 = 同样成功率省多少成本。
 4. **每一步带证伪条件**：证伪就回退，不往上跳级。
 
 ---
@@ -26,76 +31,87 @@
 | NeoHorse 2609.08183 | 0.95 训 agent LLM | 0.50 中 | 0.90 内部 |
 | CERA-MoA | 0.55 两者同训 | 0.55 中 | 0.85 内部 |
 
-**演进主轴**：`外部·改文本（RSI-Router）→ 外部·训路由器（本方案）→ 内部·训 LLM（NeoHorse/CERA）`。
-
-**守弱底线**：本方案改的是「路由器」（中段），势能区在「训 LLM」（顶端），但中间隔着三道坎——**训谁、反馈可不可靠、有没有训练预算**。**不跳级。**
+**演进主轴**：`外部·改文本（RSI-Router）→ 外部·训路由器（本方案）→ 内部·训 LLM（NeoHorse/CERA）`。守弱底线：本方案改的是「路由器」（中段），势能区在「训 LLM」（顶端），三道坎（训谁/反馈可不可靠/有没有预算），**不跳级**。
 
 ---
 
 ## 1. 一句话设计
 
 ```
-用户 query → agent 拆多步 → 每一步由路由策略选"执行设备"（从在线设备池选一台）→ 直到任务完成
-   "级联/重试"不设独立层：当前步答得差（P(fail) 高）→ 下一步就是"换更强设备重试这一步"
+用户 query → agent 拆多步 → 每步由策略在「停」∪「single/multi/agentic × 在线设备」里选一个
+→ 直到任务完成；"级联重试"= multi 模式内部由策略学的 handoff（换更强设备重做这一步）
 ```
 
-- 一次"路由决策" = 一步选一台设备；
-- `can_execute=False` 的设备（如当前部署的手表）只作入口/输出，**不进动作空间**——这是**部署配置，非架构假设**。
-
-![AgentRouter 完整架构总览（v20）](../diagrams/architecture-overview.png)
+- 一次"路由决策" = 一步选「模式 × 设备」；
+- `can_execute=False` 的设备只作入口/输出，不进动作空间（部署配置，非架构假设）。
 
 ---
 
-## 2. 单层 MDP（核心）
+## 2. 单层 MDP（核心，Hera 主骨架）
 
 ```
-State:  s_t = ( 轨迹摘要, 任务进度, 上一步输出 + P(fail), 已用成本 C_t, 设备状态 D_t, 步数 t )
-Action: a_t ∈ { Stop } ∪ { d_i : d_i ∈ 在线可执行设备池 }   # 动态集合，不枚举类型
+State:  s_t = ( 轨迹摘要, 任务进度, 上一步输出, 已用成本 C_t, 设备状态 D_t, 步数 t )
+Action: a_t ∈ { Stop } ∪ { single, multi, agentic } × { 在线可执行设备 }   # 模式 × 设备，动态集合
+        agentic 模式再选一个工具（M1 预定义工具集）
 Reward: R = 任务最终成功 − Σ 各设备调用成本
-折扣/深度: γ = 1；设 T_max = 可执行设备数（M1 = 3 档设备 → T_max=3；对齐 RLCascadeRouter 的候选池逻辑）
+折扣/深度: γ = 1；T_max = 可执行设备数（M1 = 3 档设备 → T_max=3）
 ```
 
-**成本函数（每步）**：`κ(设备i) = c_tier(cap_embed_i) + λ_lat·latency_ms/1000 + λ_energy·energy_j + λ_kv·kv_bytes`（本机 kv=0；`c_tier` 随能力档递增保证"云最贵"；λ 为超参）。
+**成本函数（每步）**：`κ(设备i) = c_tier(cap_embed_i) + λ_lat·latency_ms/1000 + λ_energy·energy_j + λ_kv·kv_bytes`（本机 kv=0；`c_tier` 随能力档递增保证"云最贵"）。
 
-**λ 旋钮（吸收 RouteFM）**：λ=(λ_lat,λ_energy,λ_kv) 不是"训好就焊死"，而是**条件化进策略输入**（StepState 追加 λ 字段）。学 RouteFM"冻结路由器换 λ 免重训"——否则"一个 λ = 一个策略"，改偏好就要重训，工程上很贵。
+**λ 旋钮（吸收 RouteFM）**：λ=(λ_lat,λ_energy,λ_kv) **条件化进策略输入**（StepState 追加 λ 字段），换 λ 免重训。
 
-**为什么单层**：RLCascadeRouter / Hera / GraphPlanner 全是单层 MDP。"级联"在 agent 多步里就是"下一步重试"，是同一 MDP 里的一个 action，不需要独立层。
+**骨架主次（正本清源）**：**Hera（step-level 多步）为主、RLCascadeRouter（VAS/CE）为实现**。"级联重试"是 multi 模式内部的 handoff（策略学的动作），不是写死的默认动作。RLCascadeRouter / Hera / GraphPlanner 全是单层 MDP——单层这个结论不变，但**骨架归属从 RLCascadeRouter 纠回 Hera**。
 
 ---
 
-## 3. 策略网络（VAS + CE，复用 RLCascadeRouter 结构）
+## 3. 策略网络（VAS + CE + 模式门，quality-estimator-free）
 
 ```
-CE： self-attention 处理 { Stop } ∪ 在线设备实例 → 给每个设备打分（能力互补）
-     每个设备实例一个 action token：e_i = [h_s; cap_embed_i; 状态_i; f(q, device_i)]
-     f(q, device_i) = query-设备匹配分（网络学，多维能力隐式捕获）
-VAS： Stop Gate 产 STOP/CONTINUE + Critic 估价值
-最终： softmax( mask( [logit_stop] ∪ [logit_cont + score_i] ) )
+CE： self-attention 处理 { Stop } ∪ (模式 × 设备) 实例 → 给每个 (模式,设备) 打分（能力互补）
+     每个设备实例 action token：e_i = [h_s; cap_embed_i; 状态_i; f(q, device_i)]
+VAS： 模式门 产 {停, single, multi, agentic} logits + Critic 估价值    # 吸收 RouteWeaver
+最终： softmax( mask( [logit_stop] ∪ [logit_mode + score_i] ∪ [logit_agentic + score_tool_j + score_i] ) )
 ```
 
-**P(fail)**（Brier 校准的失败概率）作为**状态**喂 VAS。⚠️ 其底层特征（熵/logP/集成分歧）需**按能力档归一化**（0.5B 与 70B 的 logP 尺度不同），校准器按 cap_embed 条件化。
+**无 P(fail)**：回到 RLCascadeRouter 的 quality-estimator-free——不建质量估计器、不设校准阈值。升级信号推迟 M2 且必须过"五种自欺"清单（difficulty-only 对照等）。
 
-> **论文分工**（三个正交维度）：Hera → 训练范式；RLCascadeRouter → 策略网络结构；ProgRouter → 状态设计。
+> **论文分工**：**Hera → 主骨架**（step-level 多步训练范式）；RLCascadeRouter → 策略网络结构（VAS/CE）；ProgRouter → 状态设计（进度）；RouteWeaver → 模式门（三模式）；RIVET → 训练侧 response-informed 值估计；Handoff Curves → supervision target。
 
 ---
 
-## 4. 训练（Hera 两阶段 + shaping）
+## 4. 训练（离线答案表 + Hera 两阶段 + 吸收）
+
+### 4.0 离线答案表（训练前一次性建，吸收 RLCascadeRouter）
 
 ```
-① IL 冷启动：回放最高能力档设备轨迹，每步标签 = 最便宜够用设备（多分类对齐动作空间）→ 交叉熵
-② cost-aware RL：按"更高回报 + 更少高成本调用"更新（PPO/策略梯度）
+对每个 task × 每个设备：调真实 API → 拿答案 + 成本 → 判对错（对照 GT）
+→ answer_table[task][device] = (correct: bool, cost: float)
+→ 之后 IL/RL 全查表，几十万局不碰真实 API（解决真执行慢 + API 超时）
 ```
 
-**奖励 = 延迟主奖励 + 增量 shaping（解稀疏奖励）**：
+### 4.1 IL 冷启动（只当"不崩"初始化 + Handoff supervision target）
+
 ```
-主奖励  R_terminal = 任务成功 − λ·高成本调用比例
-shaping r_t = U(s_{t+1}) − U(s_t)；U = α·质量̂ + (1−α)·成本节省̂；Σ r_t = 终态效用
-质量̂ = (P−P_min)/(P_max−P_min)；成本节省̂ = 1 − C/C_max
+① 标签 = 最便宜够用设备（从答案表 GT 算）
+② 吸收 Handoff（2610.15993）：标签用"剩余工作所需能力档 + 前方困难步"（monotone fit），
+   不用"噪声逐步对错"——Handoff 实测换 supervision target 提 7.8pp
+③ 交叉熵训 VAS/CE；目的只是"先选最便宜的够用设备、别崩"
 ```
 
-**质量信号（M1）**：benchmark 客观 GT（可执行环境判对错）；过程验证器（R2V）留 M2+ 作无 GT 场景替代。
+### 4.2 cost-aware RL（核心 · 查表采样 + RIVET）
 
-**训练加速（吸收 RLCascadeRouter 实现细节）**：对有 GT 的 benchmark（AppWorld 的 `evaluate()`），**先一次性预生成「设备×任务 → 成功/成本」表**，训练时"调用设备 = 查表"，几十万局不碰真实 API——直接解决"真执行采样慢 + API 超时"两个痛点。真执行/在线精调（M2）仍用真实调用，不查表。
+```
+① 以 IL 权重初始化
+② 查表采样轨迹：每步策略采样 (模式, 设备) → 查表拿 correct/cost + 该步 response → 更新状态
+③ 奖励 = 最终成功 − λ·累计成本（+ 增量 shaping r_t = U(s_{t+1})−U(s_t)，γ=1 → 轨迹回报=终态效用）
+④ 吸收 RIVET（2610.23239）：训练侧加 training-only 的 response-informed value estimator
+   （看得到已产生的 response），把"响应引入的回报方差"从噪声变观测协变量 → 减小估计误差；
+   部署仍 pre-call（看不到 response）
+⑤ REINFORCE/PPO + exploration，学"single 一步够 / multi 多步 / agentic 调工具 + 何时升级"
+```
+
+**β 只作评估天花板（1−β）**：β 是反事实宏观量（需"全模型×全query对错表"，运行时不可得），**不进 RL 输入、不做训练 ROI gate、不做模式空间剪枝**；只在 §7.6 评估时作为"多模型组合收益上限"。
 
 ---
 
@@ -103,114 +119,75 @@ shaping r_t = U(s_{t+1}) − U(s_t)；U = α·质量̂ + (1−α)·成本节省�
 
 | 结构 | 字段 |
 |---|---|
-| `DeviceState` | device_id, cap_embed(能力嵌入向量), battery_pct, temp_c, mem_free_gb, network_bw_mbps, can_execute, online, last_heartbeat |
-| `StepState` | 轨迹摘要, 任务进度, 上一步输出+P(fail), C_t, D_t, t |
-| `StepAction` | action(Stop / 设备实例id), p_fail |
+| `DeviceState` | device_id, cap_embed, battery_pct, temp_c, mem_free_gb, network_bw_mbps, can_execute, online, last_heartbeat |
+| `StepState` | 轨迹摘要, 任务进度, 上一步输出, C_t, D_t, t, **λ(偏好旋钮)** |
+| `StepAction` | action(Stop / 模式×设备×工具) |
 | `StepObservation` | latency_ms, energy_j, kv_bytes, kv_ms, quality, success |
-| `TrainingRecord` | 轨迹（state/action/reward 序列 + 终态效用） |
-| `StrategyPackage` | version, vas_weights, ce_weights, p_fail_weights |
+| `TrainingRecord` | 轨迹（state/action/reward + 终态效用 + 该步 response） |
+| `StrategyPackage` | version, vas_weights, ce_weights |
 
 ---
 
-## 6. 模块清单（输入 → 输出）
+## 6. 模块清单
 
 | 层 | 模块 | 输入 → 输出 |
 |---|---|---|
 | L1 | 设备发现·心跳 | — → List\<DeviceState\> |
 | L1 | 设备状态采集 | 黑盒 → 归一化连续值 |
-| L2 | 状态编码 | 轨迹+进度+上一步输出+设备状态 → StepState（含 P(fail)） |
-| L2 | VAS+CE 策略 | StepState → StepAction（VAS 直接消费 P(fail)） |
+| L2 | 状态编码 | 轨迹+进度+上一步输出+设备状态+λ → StepState |
+| L2 | VAS+CE+模式门 | StepState → StepAction（模式×设备） |
 | L3 | 执行器 | 动作 → 本步输出+观测（本机=迁移0 / 跨设备=KV迁移+传输） |
-| L4 | IL 冷启动 + cost-aware RL | 轨迹 → VAS/CE 权重 |
-
-> M1 只用 L1/L2/L3/L4 四层（L4=训练）；记录器+脱敏、灰度下发 → M2。
+| L4 | 离线答案表 + IL + cost-aware RL | 轨迹 → VAS/CE 权重 |
 
 ---
 
-## 7. 演进路线（里程碑 + 三层改进路线）
+## 7. 演进路线
 
 ### 7.1 里程碑
 
-| 里程碑 | 交付 | 验收 | 核心依据 |
-|---|---|---|---|
-| **M1** | agent 多步路由：单层 MDP + VAS/CE + Hera 两阶段训练（3 档设备 weak/medium/strong）——**离线答案表建表 → IL 静态标签只当初始化 → RL 真执行查表采样（核心）** | **同样成功率下成本节省**（非成功率涨分）；多种子+误差棒；消融比 Pareto | Hera + RLCascadeRouter |
-| **M2** | 在线更新：云侧 bandit 持续精调 | regret↓、无退化 | WISERouter |
-| **M3** | 四设备全池 + KV 迁移优化 | 延迟↓、KV 成本↓ | Unified AI Gateway |
-| **M4（远期）** | 路由内化为 agent 能力 + 自我改进 LLM | 端到端自进化 | RSI / CERA-MoA / SPIN |
-
-### 7.2 两个正交轴（演进框架）
-
-| 方案 | 轴A 路由器在哪 | 轴B 更新谁 |
+| 里程碑 | 交付 | 验收 |
 |---|---|---|
-| 本方案（AgentRouter） | 外部（独立 VAS/CE） | 路由器 |
-| RSI / NeoHorse | 内部（agent 流水线一环） | agent 的 LLM |
-| SPIN / ReST-MCTS / Tao | —（不一定是路由） | agent 的 LLM |
-| CERA-MoA | 内部（co-evolve） | 两者都更新 |
+| **M1** | agent 多步路由：单层 MDP + VAS/CE + 模式门（三模式）+ 离线答案表 + IL/RL（3 档设备） | **同样成功率下成本节省**；多种子+误差棒；消融比 Pareto；β 作天花板 |
+| **M2** | 在线更新：云侧 bandit 持续精调（吸收 MixLLM 候选集动态变化）+ 升级信号（过五自欺清单） | regret↓、无退化 |
+| **M3** | 四设备全池 + KV 迁移优化 | 延迟↓、KV 成本↓ |
+| **M4（远期）** | 路由内化 + 自我改进 LLM（CERA/NeoHorse） | 四门槛全满足才动 |
 
-**关键澄清**：SPIN/ReST-MCTS/Tao 本质是「自我改进 LLM」（反馈来自自对弈/奖励/树搜索），与"路由"无必然关系；只有 NeoHorse 把"自我改进"和"路由采数"绑定。
+### 7.2 三层改进路线（守弱 · 带证伪条件）
 
-### 7.3 三层改进路线（守弱 · 带证伪条件）
+**层1（M1→M2）**：子任务特征（替换手工 progress，AB 证伪）、技能（绑能力档，量化 token 代价）、路由器级闭环（regret 证伪）、**训练数据治理**（ReST/SPIN 前移）。
 
-**层 1（M1→M2 · 现在做 · 强证据 · 低风险）**
+**层2（M2→M3 · 咽喉）**：无 GT 验证器（仅 R2V，硬门槛=验证器可靠）+ **升级信号（过"五种自欺"清单）**。
 
-| # | 改进 | 做法 | 证伪条件（不满足就砍） |
-|---|---|---|---|
-| 1.1 | 子任务挖掘 → 替换手工 progress | 从轨迹挖「Locate/Implement/Verify」作状态特征 | AB 不赢手工 progress → 不用 |
-| 1.2 | 技能 → 设备执行增强（**第三档·改笔记，有天花板**） | 给「子任务 × 能力档」生成技能 prompt（绑能力档不绑模型名）；**定性=有限增益的 prompt 增强，非能力进化** | 技能 token 代价 > 质量/成本收益 → 砍；**天花板=设备底座锁死** |
-| 1.3 | 路由器级「评估→选择→更新」闭环 | NeoHorse 式闭环，只更新路由器权重；M2 bandit + 触发式更新 | 分布漂移下 regret 不降 → 路由器这层没站稳 |
-| 1.4 | 训练数据治理（**第一档·前移**） | ReST-MCTS 式过程奖励+树搜索、只挑可验证正确轨迹重训；SPIN 式设备间自对弈判别 | 治理后 IL/RL 不赢「静态/真执行标签」→ 数据治理无增益，回退 |
+**层3（M4+）**：训 LLM（四门槛：验证器/预算/防 reward hacking/跨域证据）。
 
-**层 2（M2→M3 · 中期咽喉 · 中证据 · 必须 AB）**
+### 7.3 吸收做法
 
-| 改进 | 做法 | 证伪 |
-|---|---|---|
-| 无 GT 场景的验证器（仅 R2V） | R2V 过程验证器（ReST/SPIN 已前移到层1.4）；**硬门槛=验证器本身可靠**（Formal-Verification-RSI 关注点） | 替代信号跨域不赢「纯 GT 训练」→ 反馈替代不可用 |
+- RSI-Router 的「子任务/技能」= 第三档（改笔记），天花板被底座锁死，只当有限 prompt 增强；
+- RouteFM（2609.37362）：匿名候选+行为观测 → cap_embed 升多维（M2）；λ 条件化（M1）；预训练底座（M2）；
+- SkillEval（2610.28767）：认知诊断学 per-skill 能力画像（cap_embed 多维的现成做法）。
 
-**层 3（M4+ · 远期 · 弱证据 · 有条件才动）**：路由内化 + 训 agent LLM。四门槛（全满足才启动）：①可靠验证器 ②训练预算 ③防 reward hacking ④跨域泛化证据。不满足 → 回退「只训路由器」。
+### 7.4 重训触发点（绑能力档不绑模型名）
 
-### 7.4 吸收 RSI-Router 的做法（参考 2609.34712）
+换模型（同档）/ 设备池加退 → 不重训（cap_embed 更新 + 动态 mask）；任务分布漂移 → M2 在线精调；**新能力档（分布外）→ 重训/在线精调**。
 
-- ①「子任务」→ VAS/CE 状态特征（替换手工 progress）；
-- ②「技能」→ 设备执行增强（执行时追加"子任务×设备"技能 prompt，临时提升有效能力）。
+### 7.5 评估口径 + 跨域验证
 
-**吸收原则（避免重新引入模型耦合）**：技能绑「**能力档**」不绑「模型名」；把"模型专属失败画像"下沉到 **cap_embed**；技能靠 M2 在线微调（触发式）做精细自适应。这样吸收后仍保持"能力档抽象、模型可替换"。
-
-### 7.5 重训触发点 + 更新频率
-
-| 触发事件 | RSI-Router（技能绑死模型） | AgentRouter（绑死能力档 cap_embed） |
-|---|---|---|
-| 端侧小模型换掉/升级 | ⚠️ 重训（技能失效） | ✅ cap_embed 更新 + M2 在线精调 |
-| 云侧大模型换掉 | ⚠️ 重训（参照轨迹变了） | ✅ 同上 |
-| proposal agent 换 | ✅ 不重训 | 无对应 |
-| 任务分布漂移 | ⚠️ 重跑整个进化 | ✅ M2 在线 bandit 精调 |
-| 设备池变化（同档加入/退出） | 未涵盖 | ✅ 动作空间动态 mask |
-| 新「能力档」设备（cap_embed 分布外） | ⚠️ 需重挖子任务 | ⚠️ 泛化无保证 → 重训/在线精调 |
-
-**更新频率（触发式，非固定定时）**：端侧阈值分钟级 / 云侧权重 24h 或按批 / 完整重进化周级 / 增量技能日级；触发条件 = 累计新轨迹 ≥ N、或检测到分布漂移、或设备池变化。
-
-### 7.6 评估口径 + 跨域验证
-
-- **评估口径**：Hera 式成功率@成本 → LLMRouterBench 式 PGR/APD/成本节省率 → Pareto 前沿；基线含 纯弱/纯强/oracle(最便宜够用)/随机/固定阈值 + **RSI-Router**。
-  - **天花板认知**：路由天花板 = 池内最强设备；路由收益**主要来自「同样成功率下省多少成本」，不是「成功率涨几个点」**（RLCascadeRouter 也就 +1~3 分、但省 20~34% 成本）。验收锚点据此设"成本节省"，不设"成功率大幅提升"。
-  - **统计严谨**：多种子（不只 seed 42）+ 报标准差/置信区间，否则"赢 0.97 分"站不住。
-  - **消融口径**：比"各变体的 Pareto 前沿"（或同一 λ 下的 U_λ），不拆两列只盯成功率（RLCascadeRouter 完整版反而最贵）。
-- **跨域泛化验证**：训练在 benchmark A、测试在 benchmark B（AppWorld 训 → WebShop/ALFWorld 测）。本方案特征（cap_embed/P(fail)/成本/进度）是**领域无关**的，**最多少样本迁移（RouteFM 路线：几条观测起步）**，天然优于 RSI 的"子任务定义"这类领域绑死文本——但**零样本跨域无人解决，别预设"领域无关特征"就能零样本跨域**，需实证。
+- **评估口径**：成功率@成本 → PGR/APD/成本节省率 → Pareto；基线含 纯弱/纯强/oracle/随机/固定阈值 + RSI-Router。
+  - **天花板**：路由天花板 = 池内最强设备；**β 只作"多模型组合收益上限 1−β"**（评估用，不学、不做 ROI gate）。
+  - **统计严谨**：多种子 + 标准差/置信区间。
+  - **消融**：比 Pareto 前沿，不拆两列只盯成功率。
+  - **评测基准**：**TwinRouterBench 开源仓**（per-step 静态标签 + live SWE-bench + leaderboard）为主；RouterWorld（多轮 + 部分可观测）作补充。
+- **跨域**：AppWorld 训 → WebShop/ALFWorld 测；特征领域无关**最多少样本迁移（RouteFM 路线）**，零样本别预设。
 
 ---
 
-## 8. 设计红线（被证伪 + 守弱）
+## 8. 设计红线（守弱 5 条）
 
-**被证伪（明确不做）**：
-1. ❌ 不做 one-shot 粗粒度、不做手工阈值（被 RLCascadeRouter/Hera 证伪）；
-2. ❌ 不该设"内层级联"独立层（级联溶解为重试）；
-3. **P(fail) 失准** → 外部锚周期校验；**退化收敛** → 回滚；**噪声裁判** → 删在线判官。
-
-**守弱红线（5 条）**：
-1. 不预设「自我改进会稳定增益」（这件事本身没被证明）；
-2. 技能/训 LLM 不是免费午餐（先量化 token 代价，不达标就砍）；
-3. 在线更新会退化（保留版本化回滚 + 外部锚周期校验）；
-4. **每轮更新必做「新 vs 旧权重」对照评测**（rsi_eval 式）——held-out 集上证明不退化才准上线；
-5. **零样本跨域泛化是开放问题**——别预设"领域无关特征自动跨域"，只能朝 RouteFM 少样本路线走（几条观测起步），零样本不抱幻想。
+1. 不预设「自我改进会稳定增益」（未证明）；
+2. 技能/训 LLM 不是免费午餐（量化 token 代价）；
+3. 在线更新会退化（版本化回滚 + 外部锚校验）；
+4. 每轮更新必做「新 vs 旧权重」对照评测（rsi_eval 式）；
+5. **零样本跨域泛化是开放问题**（最多 RouteFM 少样本，别预设领域无关特征自动跨域）。
 
 ---
 
@@ -218,33 +195,31 @@ shaping r_t = U(s_{t+1}) − U(s_t)；U = α·质量̂ + (1−α)·成本节省�
 
 | 论文 | 贡献 | 用在哪 |
 |---|---|---|
-| Hera（2605.24598） | step-level 单层 MDP + 两阶段训练 | **训练范式（主线）** |
-| RLCascadeRouter（2608.15817） | VAS/CE + self-attention + 增量奖励 + RL 直优 | **策略网络结构** |
-| ProgRouter（2608.25992） | multi-view 任务进度打分 | **状态里的"进度"** |
-| GraphPlanner（2604.23626） | workflow=MDP、每步选角色、图记忆 | 多智能体/选角色时 |
-| R2V（2605.16604） | 过程验证器 + CVaR | 中间奖励信号、风险规避 |
-| SynAct（2610.12651） | 价值加权反馈 | 反馈采样 |
-| TwinRouterBench（2605.18859） | agentic 路由评测 | 评估基准 |
-| Unified AI Gateway（2609.06940） | 路由+KV 联合 | M3 |
-| CERA-MoA（2609.18779） | 路由-代理共演化 | 远期（M4+） |
-| RSI-Router（2609.34712） | 子任务级路由 + 技能演化 | 层1 吸收（子任务/技能） |
-| NeoHorse（2609.08183） | 路由采数 → 训 LLM | 层3 远期（有条件） |
-| RouteFM（2609.37362） | 预训练路由底座 + 匿名候选行为观测 + regret loss + λ条件化 | M2 吸收（少样本跨域，见《RouteFM 吸收笔记》） |
+| **Hera**（2605.24598） | step-level 多步 + IL/RL | **主骨架** |
+| **RLCascadeRouter**（2608.15817） | VAS/CE + 增量奖励 + RL 直优 + 离线答案表 | **策略网络实现** |
+| ProgRouter（2608.25992） | multi-view 进度 | 状态 |
+| **RouteWeaver**（2610.19705） | 模式选择（single/multi/agentic）+ COMET-GRPO | 模式门（M1 就学） |
+| **RIVET**（2610.23239） | response-informed 值估计 | RL 训练侧 |
+| **Handoff Curves**（2610.15993） | supervision target 改造 + handoff 实证 | IL 标签 |
+| β 上限（2606.27288） | 共失败率 | 评估天花板 |
+| Strong Reasoners（2611.04098） | β 实测（强推理进池 premium 极小） | 天花板警示 |
+| RouteFM（2609.37362） | 少样本跨域 + λ 条件化 + 预训练底座 | 跨域/M2 |
+| MixLLM（2502.18482） | bandit 持续 + 候选集动态 | M2 |
+| RSI-Router / NeoHorse | 子任务+技能 / 训 LLM | 层1 吸收 / M4 |
+| TwinRouterBench（2605.18859）/ RouterWorld（2610.26511） | agentic 路由评测 | 评估基准 |
 
-> **M1 最小实现只认 2 篇**：Hera（训练）+ RLCascadeRouter（VAS/CE）；其余 → M2+ 或遇到具体问题时再查。
+> **M1 最小实现只认**：Hera（骨架）+ RLCascadeRouter（VAS/CE + 离线答案表）+ RouteWeaver（模式门）+ RIVET/Handoff（训练配件）。
 
 ---
 
 ## 10. 落地路线图
 
-| 阶段 | 对应 | 要做的事 | 当前状态 |
-|---|---|---|---|
-| 现在 | M1 | 三 benchmark 跑通真实训练（AppWorld 真执行 + 静态 IL；ALFWorld/WebShop 接 adapter） | AppWorld 训练后台跑；ALFWorld 待 make、WebShop 待数据 |
-| 下一步 | M1→M2 | 层1.1 子任务特征（AB）、层1.2 技能（量化 token 代价）、层1.3 M2 bandit | 未开始 |
-| 中期咽喉 | M2→M3 | 层2 无 GT 反馈来源 + 触发式更新 | 未开始 |
-| 远期有条件 | M4+ | 层3 训 LLM（四门槛全满足才动） | 不启动 |
-
-**每一步带证伪条件**：证伪了就回退，不往上跳。
+| 阶段 | 对应 | 要做的事 |
+|---|---|---|
+| 现在 | M1 | 三模式 benchmark（模式×难度二维）→ 弱强分化验证 → 建答案表 → IL → RL → TwinRouterBench 评估 |
+| 下一步 | M1→M2 | 子任务特征、技能、路由器级闭环、数据治理 |
+| 中期咽喉 | M2→M3 | 无 GT 验证器 + 升级信号（五自欺清单） |
+| 远期 | M4+ | 训 LLM（四门槛） |
 
 ---
 
